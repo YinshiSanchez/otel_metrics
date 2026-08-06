@@ -133,6 +133,7 @@ struct GaugeOptions : InstrumentOptions {
 
 struct RuntimeStats {
   bool initialized = false;
+  bool disabled = false;
   std::uint64_t successful_exports = 0;
   std::uint64_t failed_exports = 0;
   std::uint64_t dropped_measurements = 0;

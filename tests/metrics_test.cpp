@@ -67,12 +67,14 @@ const sdk_metrics::PointType *OnlyPoint(
 }
 
 void TestValidation() {
+  EnvironmentGuard disabled_guard("OTEL_SDK_DISABLED");
   EnvironmentGuard service_guard("OTEL_SERVICE_NAME");
   EnvironmentGuard resource_guard("OTEL_RESOURCE_ATTRIBUTES");
   EnvironmentGuard protocol_guard("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL");
   unsetenv("OTEL_SERVICE_NAME");
   unsetenv("OTEL_RESOURCE_ATTRIBUTES");
   unsetenv("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL");
+  setenv("OTEL_SDK_DISABLED", "false", 1);
 
   otel_metrics::Config missing_service;
   missing_service.protocol = otel_metrics::Protocol::kHttpProtobuf;
@@ -94,6 +96,60 @@ void TestValidation() {
   Check(otel_metrics::Initialize(invalid_protocol).code() ==
             otel_metrics::StatusCode::kInvalidArgument,
         "unsupported environment protocol is rejected");
+}
+
+void TestDisabledRuntime() {
+  EnvironmentGuard disabled_guard("OTEL_SDK_DISABLED");
+  setenv("OTEL_SDK_DISABLED", "TrUe", 1);
+
+  auto data =
+      std::make_shared<memory_exporter::SimpleAggregateInMemoryMetricData>();
+  auto exporter = memory_exporter::InMemoryMetricExporterFactory::Create(data);
+
+  otel_metrics::Config config;
+  Check(
+      otel_metrics::testing::InitializeWithExporter(config, std::move(exporter))
+          .ok(),
+      "disabled runtime initializes without exporter configuration");
+  Check(otel_metrics::IsInitialized(),
+        "disabled runtime reports initialized");
+
+  const auto stats = otel_metrics::GetRuntimeStats();
+  Check(stats.initialized && stats.disabled,
+        "runtime stats report that metrics are disabled");
+
+  auto counter = Take(otel_metrics::CreateCounter<std::uint64_t>(
+                          {"disabled.requests", "requests", "{request}"}),
+                      "create Counter while metrics are disabled");
+  auto histogram = Take(otel_metrics::CreateHistogram<double>(
+                            {{"disabled.latency", "latency", "s"}, {0.1, 1.0}}),
+                        "create Histogram while metrics are disabled");
+  otel_metrics::GaugeOptions gauge_options;
+  gauge_options.name = "disabled.temperature";
+  auto gauge = Take(otel_metrics::CreateGauge<double>(gauge_options),
+                    "create Gauge while metrics are disabled");
+
+  Check(counter.Add(1, {{"route", "/health"}}),
+        "disabled Counter accepts a measurement as a no-op");
+  Check(histogram.Record(std::numeric_limits<double>::quiet_NaN()),
+        "disabled Histogram avoids measurement validation work");
+  Check(gauge.Set(42.0, {{"zone", "a"}}),
+        "disabled Gauge accepts a measurement as a no-op");
+  Check(!gauge.Remove({{"zone", "a"}}) && gauge.Clear() == 0,
+        "disabled Gauge does not retain series");
+  Check(otel_metrics::ForceFlush(std::chrono::seconds(1)).ok(),
+        "disabled runtime force flush is a no-op");
+
+  const auto after_records = otel_metrics::GetRuntimeStats();
+  Check(after_records.successful_exports == 0 &&
+            after_records.failed_exports == 0 &&
+            after_records.dropped_measurements == 0,
+        "disabled runtime neither exports nor counts intentional no-ops as drops");
+
+  Check(otel_metrics::Shutdown(std::chrono::seconds(1)).ok(),
+        "disabled runtime shuts down");
+  Check(!counter.Add(1),
+        "disabled runtime handles become inert after shutdown");
 }
 
 void TestInstrumentsAndLifecycle() {
@@ -286,7 +342,10 @@ void TestInstrumentsAndLifecycle() {
 } // namespace
 
 int main() {
+  EnvironmentGuard disabled_guard("OTEL_SDK_DISABLED");
+  unsetenv("OTEL_SDK_DISABLED");
   TestValidation();
+  TestDisabledRuntime();
   TestInstrumentsAndLifecycle();
   if (failures != 0) {
     std::cerr << failures << " test assertion(s) failed\n";

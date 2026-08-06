@@ -49,3 +49,25 @@ otel_metrics::Shutdown(std::chrono::seconds(10));
 支持 `Counter<uint64_t|double>`、`UpDownCounter<int64_t|double>`、
 `Histogram<uint64_t|double>` 和 `Gauge<int64_t|double>`。完整接口见
 `include/otel_metrics/metrics.h`。
+
+## 运行时开关
+
+程序编译后可以在启动时通过标准 OpenTelemetry 环境变量控制是否采集和发送
+Metrics：
+
+```bash
+# 关闭 Metrics
+OTEL_SDK_DISABLED=true ./your_application
+
+# 开启 Metrics（未设置时也默认开启）
+OTEL_SDK_DISABLED=false ./your_application
+```
+
+环境变量值 `true` 和 `false` 不区分大小写。关闭时 `Initialize()`、指标创建、
+`Add()`、`Record()`、`Set()` 和 `ForceFlush()` 仍然成功，但它们是 no-op：不会创建
+OTLP exporter，不聚合或发送数据，也不会保留 Gauge series。业务代码不需要为开关
+增加条件分支。可以通过 `GetRuntimeStats().disabled` 查看本次初始化是否处于禁用状态。
+
+开关在 `Initialize()` 时读取；修改运行中进程的环境变量不会即时切换。如需切换，
+应重启进程，或者先 `Shutdown()`、修改环境变量、重新 `Initialize()` 并重新创建所有
+指标句柄。

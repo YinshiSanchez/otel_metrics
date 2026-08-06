@@ -1,2 +1,3 @@
 /build/
 /CMakeUserPresets.json
+/clangd_trace.json

@@ -23,6 +23,7 @@
 #include "opentelemetry/metrics/meter.h"
 #include "opentelemetry/metrics/observer_result.h"
 #include "opentelemetry/nostd/variant.h"
+#include "opentelemetry/sdk/common/disabled.h"
 #include "opentelemetry/sdk/common/exporter_utils.h"
 #include "opentelemetry/sdk/metrics/aggregation/aggregation_config.h"
 #include "opentelemetry/sdk/metrics/export/periodic_exporting_metric_reader_factory.h"
@@ -55,6 +56,7 @@ struct AtomicStats {
 };
 
 struct EffectiveConfig {
+  bool disabled = false;
   Protocol protocol = Protocol::kHttpProtobuf;
   otlp::OtlpHttpMetricExporterOptions http_options;
   otlp::OtlpGrpcMetricExporterOptions grpc_options;
@@ -302,6 +304,15 @@ Status ValidateDurations(const Config &config) {
 }
 
 Result<EffectiveConfig> ResolveConfig(const Config &config) {
+  EffectiveConfig effective;
+  if (sdk_common::GetSdkDisabled()) {
+    effective.disabled = true;
+    effective.default_gauge_series_limit =
+        std::max<std::size_t>(1, config.default_gauge_series_limit);
+    effective.signature = "disabled";
+    return Result<EffectiveConfig>::Success(std::move(effective));
+  }
+
   if (!ValidateAttributes(config.resource_attributes)) {
     return Result<EffectiveConfig>::Failure(
         {StatusCode::kInvalidArgument,
@@ -320,7 +331,6 @@ Result<EffectiveConfig> ResolveConfig(const Config &config) {
   if (!protocol)
     return Result<EffectiveConfig>::Failure(protocol.status());
 
-  EffectiveConfig effective;
   effective.protocol = protocol.value();
   effective.scope_name = config.instrumentation_scope_name;
   effective.scope_version = config.instrumentation_scope_version;
@@ -485,6 +495,32 @@ bool WithActiveState(const std::weak_ptr<RuntimeState> &weak_state,
     return false;
   }
 }
+
+class NoopInstrument final : public detail::Instrument {
+public:
+  NoopInstrument(std::weak_ptr<RuntimeState> state,
+                 std::shared_ptr<AtomicStats> stats)
+      : state_(std::move(state)), stats_(std::move(stats)) {}
+
+  bool RecordUInt64(std::uint64_t,
+                    const Attributes &) noexcept override {
+    return Record();
+  }
+  bool RecordInt64(std::int64_t, const Attributes &) noexcept override {
+    return Record();
+  }
+  bool RecordDouble(double, const Attributes &) noexcept override {
+    return Record();
+  }
+
+private:
+  bool Record() noexcept {
+    return WithActiveState(state_, stats_, [] { return true; });
+  }
+
+  std::weak_ptr<RuntimeState> state_;
+  std::shared_ptr<AtomicStats> stats_;
+};
 
 template <typename T>
 class CounterInstrument final : public detail::Instrument {
@@ -778,6 +814,10 @@ void AddHistogramView(RuntimeState &state,
 std::shared_ptr<detail::Instrument>
 MakeInstrument(const std::shared_ptr<RuntimeState> &state,
                const InstrumentDescriptor &descriptor) {
+  if (state->config.disabled) {
+    return std::make_shared<NoopInstrument>(state, state->stats);
+  }
+
   const auto &name = descriptor.name;
   const auto &description = descriptor.description;
   const auto &unit = descriptor.unit;
@@ -827,9 +867,10 @@ MakeInstrument(const std::shared_ptr<RuntimeState> &state,
 }
 
 RuntimeStats SnapshotStats(const std::shared_ptr<AtomicStats> &stats,
-                           bool initialized) {
+                           bool initialized, bool disabled) {
   RuntimeStats snapshot;
   snapshot.initialized = initialized;
+  snapshot.disabled = disabled;
   if (!stats)
     return snapshot;
   snapshot.successful_exports =
@@ -870,6 +911,12 @@ Status InitializeRuntime(
   auto state = std::make_shared<RuntimeState>();
   state->stats = std::make_shared<AtomicStats>();
   state->config = std::move(resolved).value();
+
+  if (state->config.disabled) {
+    g_last_stats = state->stats;
+    g_runtime = std::move(state);
+    return Status::Ok();
+  }
 
   auto exporter = std::move(supplied_exporter);
   if (!exporter) {
@@ -1038,6 +1085,8 @@ Status ForceFlush(std::chrono::milliseconds timeout) {
   std::shared_lock activity_lock(state->activity_mutex);
   if (!state->active)
     return {StatusCode::kNotInitialized, "metrics runtime is shutting down"};
+  if (state->config.disabled)
+    return Status::Ok();
   if (!state->provider->ForceFlush(timeout)) {
     return {StatusCode::kTimeout, "metrics force flush failed or timed out"};
   }
@@ -1055,6 +1104,11 @@ Status Shutdown(std::chrono::milliseconds timeout) {
   auto state = g_runtime;
   std::unique_lock activity_lock(state->activity_mutex);
   state->active = false;
+  if (state->config.disabled) {
+    state->instruments.clear();
+    g_runtime.reset();
+    return Status::Ok();
+  }
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   bool flushed = state->provider->ForceFlush(Remaining(deadline));
   state->instruments.clear();
@@ -1085,7 +1139,8 @@ RuntimeStats GetRuntimeStats() noexcept {
   try {
     std::lock_guard lock(g_runtime_mutex);
     return SnapshotStats(g_runtime ? g_runtime->stats : g_last_stats,
-                         g_runtime && g_runtime->active);
+                         g_runtime && g_runtime->active,
+                         g_runtime && g_runtime->config.disabled);
   } catch (...) {
     return {};
   }
